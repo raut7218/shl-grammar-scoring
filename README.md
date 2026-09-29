@@ -6,17 +6,15 @@ Solution for the Kaggle competition **SHL Hiring Assessment 2026**: predict a 0�
 
 ```
 audio ─▶ [1] verbatim ASR ─▶ transcript ─┬─▶ [A] teacher: Qwen2.5-7B-Instruct reads the rubric → expected score (1–5)
-                                          ├─▶ [B] student: DeBERTa-v3-large
-                                          │        B1 warm-up on teacher scores, clean-sample selection (α = 0.3)
-                                          │        B2 fine-tune on gold labels (layer-wise LR decay 0.9, best epoch on inner 10%)
+                                          ├─▶ [B] student: ELECTRA-base fine-tuned on gold labels (lr 2e-5, 10 epochs)
                                           └─▶ [C] 8 transparent features (words, wpm, fillers, repeats, sentence length,
                                                     clauses/sentence, speech ratio, duration)
           [3] ridge stacker on out-of-fold student + teacher + features ─▶ [4] unscorable-audio gate (optional) ─▶ clip [0, 5]
 ```
 
-- **[1] Verbatim ASR** (`asr/asr.py`): Whisper-large-v3 with a disfluent, ungrammatical prompt so fillers, repetitions and errors are kept. Each clip is cut at its quietest point between 20 and 30 s so the prompt applies to every piece.
+- **[1] Verbatim ASR** (`asr/asr.py`): Whisper-large-v3 with a filler-only prompt so fillers, repetitions and errors are kept. Each clip is cut at its quietest point between 20 and 30 s so the prompt applies to every piece. Any piece that looks like a hallucination (a repetition loop, prompt text, or a compression ratio above 2.4) is decoded again without the prompt. An earlier prompt containing a full example sentence was copied into 4% of transcripts.
 - **[A] Teacher**: the probability-weighted mean over the next-token digits 1–5. Continuous and deterministic.
-- **[B] Student**: B1 is the method of Das, Kumar & Yadav (AACL-IJCNLP 2025, arXiv:2511.13152): after each epoch, keep only the 30% of samples with the lowest loss. B2 adds the step that paper could not take, tuning on the human labels.
+- **[B] Student**: ELECTRA-base, the backbone the host paper found best, trained on the gold labels 1–5. The paper's pseudo-label training with clean-sample selection (Das, Kumar & Yadav, AACL-IJCNLP 2025, arXiv:2511.13152) was tested and dropped: at ~475 clips per fold, selecting the lowest-loss 30% collapsed to a constant predictor (r ≈ 0), and as a warm-up it hurt gold tuning. With the selection off (α = 1) the student beat its LLM teacher (r 0.555 vs 0.540), as the paper reports.
 - **[3] Stacker**: `RidgeCV` fitted only on out-of-fold predictions.
 - **[4] Gate**: a logistic model on speech ratio, duration and word count, which detects the unscorable clips labelled 0/0.5. It is written to a separate submission file and **off by default**.
 
@@ -24,7 +22,7 @@ Clips labelled 0 or 0.5 (outside the 1–5 rubric) are never used to train the s
 
 ## Validation
 
-5-fold stratified CV (seed 42). Every learned component (B1, B2, stacker, gate) is fitted inside the training folds. The output reports Pearson, Spearman and RMSE on labels ≥ 1, RMSE on all clips, per-fold RMSE, the mandatory in-sample training RMSE, stacker coefficients and ablations (teacher, B1, B2 only, B1+B2, full stack, stack + gate).
+5-fold stratified CV (seed 42). Every learned component (student, stacker, gate) is fitted inside the training folds. The output reports Pearson, Spearman and RMSE on labels ≥ 1, RMSE on all clips, per-fold RMSE, the mandatory in-sample training RMSE, stacker coefficients and ablations (teacher, calibrated teacher, student, full stack, stack + gate).
 
 ## Run (Kaggle, GPU T4 ×2, internet on)
 

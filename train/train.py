@@ -1,10 +1,10 @@
-# Chosen method: verbatim transcript -> Qwen teacher -> DeBERTa student (B1 warm-up on teacher w/ clean-sample
-# selection, B2 gold tuning) -> ridge stacker with transparent features -> optional unscorable-audio gate.
+# Chosen method: verbatim transcript -> Qwen rubric teacher + ELECTRA student (gold labels) + transparent features
+# -> ridge stacker on out-of-fold predictions -> optional unscorable-audio gate.
 # Gold labels 0/0.5 never train the scorer (user rule). Folds identical to E1.
 import glob, os, json, gc, re, copy, time
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr, spearmanr
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_predict
+from sklearn.model_selection import StratifiedKFold
 from sklearn.linear_model import RidgeCV, LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -14,7 +14,6 @@ SEED, T0 = 42, time.time()
 SMOKE = os.environ.get("SMOKE") == "1"  # tiny stratified subset + 1 epoch per stage: catches bugs in minutes
 OUT = os.environ.get("OUT_DIR", "/kaggle/working")
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-EP = 1 if SMOKE else 4
 torch.manual_seed(SEED); np.random.seed(SEED)
 log = lambda *a: print(f"[{time.time()-T0:6.0f}s]", *a, flush=True)
 root = os.environ.get("DATA_DIR") or os.path.dirname(glob.glob("/kaggle/input/**/train.csv", recursive=True)[0])
@@ -68,8 +67,11 @@ df["teacher"], te["teacher"] = alltext.teacher.values[:len(df)], alltext.teacher
 alltext[["split","filename","teacher"]].to_csv(f"{OUT}/teacher_scores.csv", index=False)
 log("teacher done")
 
-# ---------- Stage B: DeBERTa student ----------
-BB, MAXLEN, BS = os.environ.get("BACKBONE", "microsoft/deberta-v3-large"), 256, 8
+# ---------- Stage B: student trained on gold labels ----------
+# v3 finding: the author's clean-sample warm-up (alpha=0.3) collapses at ~475 clips/fold (r ~ 0) and hurt gold tuning;
+# ELECTRA-base with plain gold training beat DeBERTa-v3-large (RMSE 0.733 vs 0.783). Settings = E1 reference run.
+BB, MAXLEN, BS = os.environ.get("BACKBONE", "google/electra-base-discriminator"), 256, 16
+EPOCHS, LR = (1 if SMOKE else 10), 2e-5
 tk = AutoTokenizer.from_pretrained(BB)
 enc = lambda t: {k: v.to(DEV) for k, v in tk(list(t), truncation=True, max_length=MAXLEN, padding=True, return_tensors="pt").items()}
 
@@ -80,71 +82,38 @@ def predict(model, texts, bs=32):
             out.append(model(**enc(texts[b:b + bs])).logits.squeeze(-1).float().cpu().numpy())
     return np.concatenate(out)
 
-def optimizer(model, lr, decay):
-    # layer-wise lr decay: head gets lr, each encoder layer below gets lr * decay^depth, embeddings the lowest
-    layers = model.deberta.encoder.layer; L = len(layers); groups = []
-    groups.append({"params": [p for n, p in model.named_parameters() if not n.startswith("deberta.")], "lr": lr})
-    groups.append({"params": list(model.deberta.encoder.rel_embeddings.parameters()) +
-                   (list(model.deberta.encoder.LayerNorm.parameters()) if hasattr(model.deberta.encoder, "LayerNorm") else []), "lr": lr})
-    for i, layer in enumerate(layers):
-        groups.append({"params": list(layer.parameters()), "lr": lr * decay ** (L - i)})
-    groups.append({"params": list(model.deberta.embeddings.parameters()), "lr": lr * decay ** (L + 1)})
-    return torch.optim.AdamW(groups, weight_decay=0.01)
-
-def run_epochs(model, texts, y, epochs, lr, alpha=1.0, decay=1.0, val=None):
-    opt, scaler = optimizer(model, lr, decay), torch.amp.GradScaler(DEV, enabled=DEV == "cuda")
-    y = np.asarray(y, dtype=np.float32); active = np.arange(len(texts)); best = (np.inf, None)
-    for ep in range(epochs):
-        model.train(); perm = np.random.permutation(active)
+def train_student(texts, y):
+    model = AutoModelForSequenceClassification.from_pretrained(BB, num_labels=1, dtype=torch.float32).to(DEV)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+    y = np.asarray(y, dtype=np.float32)
+    for ep in range(EPOCHS):  # fp32 training, as in the E1 reference run
+        model.train(); perm = np.random.permutation(len(texts))
         for b in range(0, len(perm), BS):
             idx = perm[b:b + BS]
-            with torch.autocast(DEV, dtype=torch.float16, enabled=DEV == "cuda"):
-                pred = model(**enc(texts[idx])).logits.squeeze(-1)
-            loss = ((pred.float() - torch.tensor(y[idx]).to(DEV)) ** 2).mean()
-            opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); scaler.step(opt); scaler.update()
-        if alpha < 1:  # author's clean-sample selection: keep lowest-loss alpha fraction for next epoch
-            active = np.argsort((predict(model, texts) - y) ** 2)[: int(alpha * len(texts))]
-        if val is not None:  # pick best epoch on inner split
-            r = float(np.sqrt(np.mean((predict(model, val[0]) - val[1]) ** 2)))
-            if r < best[0]: best = (r, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
-    if val is not None: model.load_state_dict(best[1])
+            loss = ((model(**enc(texts[idx])).logits.squeeze(-1) - torch.tensor(y[idx]).to(DEV)) ** 2).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
     return model
-
-def new_model():
-    return AutoModelForSequenceClassification.from_pretrained(BB, num_labels=1, dtype=torch.float32).to(DEV)  # v5 keeps checkpoint dtype (fp16) otherwise
 
 texts, ttexts, y = df.transcript.values, te.transcript.values, df.label.values
 m1 = y >= 1
 bins = np.clip(np.round(y), 2, 5).astype(int)
-folds = list(StratifiedKFold(5, shuffle=True, random_state=SEED).split(texts, bins))  # identical to E1
-V = {k: np.zeros(len(df)) for k in ["B1", "B2only", "B1B2"]}
-T = {k: np.zeros(len(te)) for k in V}
+folds = list(StratifiedKFold(5, shuffle=True, random_state=SEED).split(texts, bins))  # identical to E1 / v3
+oof_student, test_student = np.zeros(len(df)), np.zeros(len(te))
 insample = np.zeros(len(df)); incount = np.zeros(len(df))
 for k, (tri, vai) in enumerate(folds):
-    tri = tri[m1[tri]]
-    inner_tr, inner_va = train_test_split(tri, test_size=0.1, random_state=SEED, stratify=bins[tri])
-    val = (texts[inner_va], y[inner_va])
-    # B1: warm-up on teacher scores (no gold)
-    m = run_epochs(new_model(), texts[tri], df.teacher.values[tri], epochs=EP, lr=1e-5, alpha=0.3)
-    V["B1"][vai] = predict(m, texts[vai]); T["B1"] += predict(m, ttexts) / 5
-    # B2 after B1: gold tuning with LLRD, best epoch on inner split
-    m = run_epochs(m, texts[inner_tr], y[inner_tr], epochs=EP, lr=8e-6, decay=0.9, val=val)
-    V["B1B2"][vai] = predict(m, texts[vai]); T["B1B2"] += predict(m, ttexts) / 5
+    tri = tri[m1[tri]]  # gold labels 1-5 only
+    m = train_student(texts[tri], y[tri])
+    oof_student[vai] = predict(m, texts[vai]); test_student += predict(m, ttexts) / len(folds)
     insample[tri] += predict(m, texts[tri]); incount[tri] += 1
     del m; gc.collect(); torch.cuda.empty_cache() if DEV == "cuda" else None
-    # Ablation: B2 only (no warm-up)
-    m = run_epochs(new_model(), texts[inner_tr], y[inner_tr], epochs=EP, lr=8e-6, decay=0.9, val=val)
-    V["B2only"][vai] = predict(m, texts[vai]); T["B2only"] += predict(m, ttexts) / 5
-    del m; gc.collect(); torch.cuda.empty_cache() if DEV == "cuda" else None
-    log(f"fold {k} done", {n: round(float(np.sqrt(np.mean((V[n][vai][m1[vai]] - y[vai][m1[vai]]) ** 2))), 3) for n in V})
+    log(f"fold {k} student rmse(1-5)", round(float(np.sqrt(np.mean((oof_student[vai][m1[vai]] - y[vai][m1[vai]]) ** 2))), 3))
 
 # ---------- Stage 3: ridge stacker on OOF inputs ----------
 def X(frame_student, frame_teacher, Fpart):
     return np.column_stack([frame_student, frame_teacher, Fpart[FEATS].values])
 Ftr, Fte = F.iloc[:len(df)].reset_index(drop=True), F.iloc[len(df):].reset_index(drop=True)
 stack = lambda: make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-2, 3, 30)))
-Xtr, Xte = X(V["B1B2"], df.teacher.values, Ftr), X(T["B1B2"], te.teacher.values, Fte)
+Xtr, Xte = X(oof_student, df.teacher.values, Ftr), X(test_student, te.teacher.values, Fte)
 oof_stack = np.zeros(len(df))
 for tri, vai in folds:  # same folds; stacker fits only on label>=1 training-fold clips
     tri = tri[m1[tri]]; oof_stack[vai] = stack().fit(Xtr[tri], y[tri]).predict(Xtr[vai])
@@ -175,8 +144,7 @@ def M(yv, p): return dict(pearson=round(float(pearsonr(yv, p)[0]), 4), spearman=
                           rmse=round(float(np.sqrt(np.mean((yv - p) ** 2))), 4))
 clip = lambda p: np.clip(p, 0, 5)
 rows = {"Teacher raw (zero-shot)": df.teacher.values, "Teacher + linear calibration": oof_teacher_cal,
-        "B1 student (author warm-up only)": V["B1"], "B2 only (gold, no warm-up)": V["B2only"],
-        "B1 + B2 (chosen student)": V["B1B2"], "Full stack (chosen)": oof_stack}
+        "Student (ELECTRA-base, gold)": oof_student, "Full stack (chosen)": oof_stack}
 res = {n: {"label>=1": M(y[m1], clip(p)[m1]), "all clips": M(y, clip(p))} for n, p in rows.items()}
 res["Full stack + gate (all clips)"] = {"all clips": M(y, clip(gated))}
 zi = ~m1
