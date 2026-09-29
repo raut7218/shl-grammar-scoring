@@ -16,9 +16,9 @@ audio ─▶ [1] verbatim ASR ─▶ transcript ─┬─▶ [A] teacher: Qwen2.
 - **[A] Teacher**: the probability-weighted mean over the next-token digits 1–5. Continuous and deterministic.
 - **[B] Student**: ELECTRA-base, the backbone the host paper found best, trained on the gold labels 1–5. The paper's pseudo-label training with clean-sample selection (Das, Kumar & Yadav, AACL-IJCNLP 2025, arXiv:2511.13152) was tested and dropped: at ~475 clips per fold, selecting the lowest-loss 30% collapsed to a constant predictor (r ≈ 0), and as a warm-up it hurt gold tuning. With the selection off (α = 1) the student beat its LLM teacher (r 0.555 vs 0.540), as the paper reports.
 - **[3] Stacker**: `RidgeCV` fitted only on out-of-fold predictions.
-- **[4] Gate**: a logistic model on speech ratio, duration and word count, which detects the unscorable clips labelled 0/0.5. It is written to a separate submission file and **off by default**.
+- **[4] Gate**: a logistic model on speech ratio, duration and word count, which detects the unscorable clips labelled 0. Both `submission_gate_on.csv` and `submission_gate_off.csv` are written. Gate-on was submitted.
 
-Clips labelled 0 or 0.5 (outside the 1–5 rubric) are never used to train the scorer.
+The 37 clips labelled 0 (outside the 1–5 rubric) are never used to train the scorer.
 
 ## Validation
 
@@ -44,12 +44,8 @@ Change the `id` / `kernel_sources` user in both `kernel-metadata.json` files to 
 | Model | Pearson (1–5) | RMSE (1–5) | RMSE (all clips) |
 |---|---|---|---|
 | Teacher, zero-shot (Qwen2.5-7B) | 0.582 | 0.847 | 1.012 |
-| Teacher + linear calibration | 0.581 | 0.825 | 0.954 |
-| Student (ELECTRA-base, gold) | 0.792 | 0.726 | 0.990 |
-| **Full stack** | **0.805** | **0.602** | 0.846 |
-| **Full stack + gate** | — | — | **0.613** (r 0.870) |
+| Student (ELECTRA-base, gold) | 0.793 | 0.727 | 0.999 |
+| **Full stack** | **0.805** | **0.601** | 0.836 |
+| **Full stack + gate** | — | — | **0.603** |
 
-- Per-fold RMSE of the full stack (labels 1–5): 0.580, 0.579, 0.620, 0.628, 0.604.
-- **Training RMSE (in-sample, mandatory): 0.244**, against 0.602 out-of-fold. The student memorises its training folds, so the out-of-fold number is the honest estimate of test performance.
-- Gate: out of fold it catches 37/37 clips labelled 0/0.5, with 3 false alarms among 732 clips labelled 1–5.
-- Fixing the Whisper prompt leak (4% of transcripts) improved the full stack from 0.638 to 0.602 RMSE.
+Training RMSE (in-sample, mandatory): 0.234. Public leaderboard: 0.4577. See **[REPORT.md](REPORT.md)** for the full architecture, metric definitions and the leakage audit.

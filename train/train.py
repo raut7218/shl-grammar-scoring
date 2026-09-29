@@ -1,7 +1,7 @@
 # Chosen method: verbatim transcript -> Qwen rubric teacher + ELECTRA student (gold labels) + transparent features
 # -> ridge stacker on out-of-fold predictions -> optional unscorable-audio gate.
-# Gold labels 0/0.5 never train the scorer (user rule). Folds identical to E1.
-import glob, os, json, gc, re, copy, time
+# Gold labels 0 (outside the 1-5 rubric) never train the scorer.
+import glob, os, json, gc, re, time
 import numpy as np, pandas as pd, torch
 from scipy.stats import pearsonr, spearmanr
 from sklearn.model_selection import StratifiedKFold
@@ -96,8 +96,8 @@ def train_student(texts, y):
 
 texts, ttexts, y = df.transcript.values, te.transcript.values, df.label.values
 m1 = y >= 1
-bins = np.clip(np.round(y), 2, 5).astype(int)
-folds = list(StratifiedKFold(5, shuffle=True, random_state=SEED).split(texts, bins))  # identical to E1 / v3
+bins = np.where(m1, np.clip(np.round(y), 2, 5), 0).astype(int)  # zero clips get their own bin so every fold has ~7
+folds = list(StratifiedKFold(5, shuffle=True, random_state=SEED).split(texts, bins))
 oof_student, test_student = np.zeros(len(df)), np.zeros(len(te))
 insample = np.zeros(len(df)); incount = np.zeros(len(df))
 for k, (tri, vai) in enumerate(folds):
@@ -131,11 +131,11 @@ oof_teacher_cal = oof_of(df.teacher.values[:, None])
 # ---------- Stage 4: unscorable-audio gate (reported; OFF by default) ----------
 G = Ftr[["f_speech_ratio", "f_duration", "f_words"]].values
 gate = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, class_weight="balanced"))
-p_zero = np.zeros(len(df))
-for tri, vai in folds:
+p_zero, gated = np.zeros(len(df)), oof_stack.copy()
+for tri, vai in folds:  # gate and its replacement value both learned from training folds only
     p_zero[vai] = gate.fit(G[tri], (y[tri] < 1).astype(int)).predict_proba(G[vai])[:, 1]
+    gated[vai] = np.where(p_zero[vai] > 0.5, y[tri][~m1[tri]].mean(), oof_stack[vai])
 ZERO = float(y[~m1].mean())
-gated = np.where(p_zero > 0.5, ZERO, oof_stack)
 gate.fit(G, (y < 1).astype(int))
 test_gate = gate.predict_proba(Fte[["f_speech_ratio", "f_duration", "f_words"]].values)[:, 1]
 
@@ -148,7 +148,7 @@ rows = {"Teacher raw (zero-shot)": df.teacher.values, "Teacher + linear calibrat
 res = {n: {"label>=1": M(y[m1], clip(p)[m1]), "all clips": M(y, clip(p))} for n, p in rows.items()}
 res["Full stack + gate (all clips)"] = {"all clips": M(y, clip(gated))}
 zi = ~m1
-res["gate detection on 0/0.5 clips"] = dict(recall=round(float((p_zero[zi] > .5).mean()), 3),
+res["gate detection on label-0 clips"] = dict(recall=round(float((p_zero[zi] > .5).mean()), 3),
                                             false_alarms_on_1to5=int((p_zero[m1] > .5).sum()))
 ins = np.where(incount > 0, insample / np.maximum(incount, 1), np.nan)
 Xin = X(ins, df.teacher.values, Ftr)
@@ -162,7 +162,7 @@ json.dump(res, open(f"{OUT}/chosen_results.json", "w"), indent=2)
 oof = df[["filename", "label", "teacher"]].copy()
 for n, p in rows.items(): oof[n] = p
 oof["p_zero"] = p_zero; oof.to_csv(f"{OUT}/chosen_oof.csv", index=False)
-# Two candidate submissions, NOT submitted: gate off (default) and gate on
+# Two candidate submissions: gate off and gate on
 pd.DataFrame({"filename": te.filename, "label": clip(test_stack)}).to_csv(f"{OUT}/submission_gate_off.csv", index=False)
 pd.DataFrame({"filename": te.filename, "label": clip(np.where(test_gate > .5, ZERO, test_stack))}).to_csv(f"{OUT}/submission_gate_on.csv", index=False)
 log("done; test clips flagged by gate:", int((test_gate > .5).sum()))
