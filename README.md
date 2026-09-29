@@ -39,6 +39,17 @@ Change the `id` / `kernel_sources` user in both `kernel-metadata.json` files to 
 - **Licences** (rule 6c): Whisper-large-v3 (MIT), Qwen2.5-7B-Instruct (Apache-2.0), DeBERTa-v3-large (MIT). CrisperWhisper was not used because of its non-commercial licence.
 - No external data, and no hand-labelling of test clips.
 
-## Results
+## Results (5-fold out-of-fold, 769 training clips)
 
-_To be filled in from `chosen_results.json`._
+| Model | Pearson (1–5) | RMSE (1–5) | RMSE (all clips) |
+|---|---|---|---|
+| Teacher, zero-shot (Qwen2.5-7B) | 0.582 | 0.847 | 1.012 |
+| Teacher + linear calibration | 0.581 | 0.825 | 0.954 |
+| Student (ELECTRA-base, gold) | 0.792 | 0.726 | 0.990 |
+| **Full stack** | **0.805** | **0.602** | 0.846 |
+| **Full stack + gate** | — | — | **0.613** (r 0.870) |
+
+- Per-fold RMSE of the full stack (labels 1–5): 0.580, 0.579, 0.620, 0.628, 0.604.
+- **Training RMSE (in-sample, mandatory): 0.244**, against 0.602 out-of-fold. The student memorises its training folds, so the out-of-fold number is the honest estimate of test performance.
+- Gate: out of fold it catches 37/37 clips labelled 0/0.5, with 3 false alarms among 732 clips labelled 1–5.
+- Fixing the Whisper prompt leak (4% of transcripts) improved the full stack from 0.638 to 0.602 RMSE.
