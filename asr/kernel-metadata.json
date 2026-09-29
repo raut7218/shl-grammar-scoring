@@ -1,0 +1,14 @@
+{
+  "id": "gauravraut1/shl-verbatim-asr",
+  "title": "shl-verbatim-asr",
+  "code_file": "asr.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "competition_sources": ["shl-hiring-assessment-2026"],
+  "dataset_sources": [],
+  "kernel_sources": []
+}
